@@ -2,6 +2,10 @@
 
 A remix of [Spectrum](https://github.com/dragosol/omarchy-spectrum) by Dragos Robu (MIT).
 
+<img src="preview.png" width="640" alt="The pinned Spectrum Remix card in a green theme: Now Playing with album art and previous / play-pause / next buttons above a 60-band analyzer split into lows, mids and highs">
+
+<img src="spectrum2.png" width="640" alt="The same card on a full desktop in a blue theme, showing the bars re-tinted from the theme accent">
+
 ## Install
 
 ```bash
