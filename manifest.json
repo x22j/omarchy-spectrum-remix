@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "jstn.spectrum-remix",
+  "name": "Spectrum Remix",
+  "version": "1.0.0",
+  "author": "jstn (remix of Spectrum by Dragos Robu)",
+  "license": "MIT",
+  "description": "A remix of Spectrum: the live octave-band visualizer is tinted from your Omarchy theme's accent, and the hover card adds a Now Playing section with previous, play/pause and next controls.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "qml/SpectrumWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Spectrum Remix",
+    "description": "Theme-coloured mini spectrum in the bar; hover for a 60-band analyzer plus Now Playing with previous / play-pause / next. Click to pin, middle-click to pause the capture.",
+    "category": "Audio",
+    "aliases": [
+      "spectrum",
+      "visualizer",
+      "now playing",
+      "media"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "colorMode": "theme",
+      "musicSink": "",
+      "speakerSink": ""
+    },
+    "schema": [
+      {
+        "key": "colorMode",
+        "type": "string",
+        "label": "Bar colours",
+        "defaultValue": "theme",
+        "description": "\"theme\" (default) shades every band from the theme accent; \"palette\" uses the original warm/mid/cool picks from the theme palette."
+      },
+      {
+        "key": "musicSink",
+        "type": "string",
+        "label": "Music sink (before EQ)",
+        "defaultValue": "",
+        "description": "Optional. PipeWire node name of your EQ's input sink. Set both sinks to get a Music / Speakers toggle; leave empty to follow the default output."
+      },
+      {
+        "key": "speakerSink",
+        "type": "string",
+        "label": "Speaker sink (after EQ)",
+        "defaultValue": "",
+        "description": "Optional. PipeWire node name of the hardware sink the EQ feeds."
+      }
+    ]
+  }
+}

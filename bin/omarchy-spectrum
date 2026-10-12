@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""omarchy-spectrum — read-only spectrum analyzer feed for the Spectrum
+Omarchy bar plugin (jstn.spectrum-remix, remixed from io.github.dragosol.spectrum).
+
+Captures a sink *monitor* with pw-record (passive: it never wakes or keeps a
+sink running, never links to anything but the monitor it is given), runs a
+Hann-windowed FFT and prints one line of band levels per frame on stdout.
+
+Output (one line per frame):
+  F b1 .. b10                          bar mode   (10 octave bands, dBFS)
+  F b1 .. b10 | l1 .. l60 | p1 .. p60 | lo mid hi
+                                       popup mode (+ 60 log bands, peak-hold,
+                                                   region band power)
+  S <state> <detail>                   status lines (capturing / restart)
+  C <command>                          a command read from the control FIFO
+
+Commands on stdin (one per line, from the widget):
+  mode bar|popup     switch analysis resolution
+  target <node>      capture the monitor of <node>; empty = default sink
+EOF on stdin (the shell went away) ends the process and the capture.
+
+Control FIFO ($XDG_RUNTIME_DIR/omarchy-spectrum-remix.ctl), for scripts/keybinds:
+  timeout 3 sh -c 'echo pin > $XDG_RUNTIME_DIR/omarchy-spectrum-remix.ctl'
+  commands: preview unpreview pin close toggle music speakers cycle state
+            pause resume playpause
+The helper only forwards them to the widget as "C <command>" lines.
+
+"pause" stops the widget's capture, which ends this process, so "resume" and
+"playpause" cannot arrive here. To resume from a script, use the shell IPC
+(omarchy-shell jstn.spectrum-remix resume) or the settings file the widget watches:
+  ~/.config/omarchy/spectrum-remix.json  {"paused": false}
+
+Levels are band power in dBFS: a full-scale sine inside a band reads 0 dB,
+so pink noise reads flat (RTA convention).
+"""
+
+import array
+import ctypes
+import ctypes.util
+import fcntl
+import math
+import os
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+# The FFT comes from FFTW, which every Omarchy system already has (pipewire-audio
+# and alsa-utils depend on it), so the plugin needs nothing beyond what
+# `omarchy plugin add` puts in place. Everything else is plain Python.
+FFTW_ESTIMATE = 1 << 6
+
+
+def load_fftw():
+    for name in ("libfftw3f.so.3", ctypes.util.find_library("fftw3f")):
+        if not name:
+            continue
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        lib.fftwf_plan_dft_r2c_1d.restype = ctypes.c_void_p
+        lib.fftwf_plan_dft_r2c_1d.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        lib.fftwf_execute.argtypes = [ctypes.c_void_p]
+        return lib
+    return None
+
+
+FFTW = load_fftw()
+if FFTW is None:
+    # Say so once and idle until the widget lets go (EOF on stdin), rather
+    # than exiting into a restart loop.
+    sys.stdout.write("S missing fftw\n")
+    sys.stdout.flush()
+    sys.stdin.read()
+    sys.exit(0)
+
+RATE = 48000
+FLOOR = -100.0
+PR_SET_PDEATHSIG = 1
+F_SETPIPE_SZ = 1031
+
+# Only in the per-user runtime dir; with none, scripts simply have no FIFO.
+_RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or ""
+CTL_PATH = os.path.join(_RUNTIME, "omarchy-spectrum-remix.ctl") if _RUNTIME else ""
+CTL_CMDS = {"preview", "unpreview", "pin", "close", "toggle", "music", "speakers", "cycle", "state",
+            "pause", "resume", "playpause"}
+
+MODES = {
+    # fft size, frames/s, release dB/s
+    "bar": {"n": 4096, "fps": 15, "fall": 40.0},
+    "popup": {"n": 8192, "fps": 30, "fall": 28.0},
+}
+
+# 10 octave bands (31.25 Hz .. 16 kHz centres) for the bar mini view.
+OCT_CENTRES = [31.25 * 2.0 ** i for i in range(10)]
+OCT_EDGES = [c / math.sqrt(2) for c in OCT_CENTRES] + [OCT_CENTRES[-1] * math.sqrt(2)]
+# 60 log-spaced bands 20 Hz .. 20 kHz (~1/6 octave) for the popup.
+POP_EDGES = [20.0 * 1000.0 ** (i / 60) for i in range(61)]
+REGION_EDGES = [20.0, 250.0, 4000.0, 20000.0]
+
+PEAK_HOLD = 1.2      # s
+PEAK_FALL = 18.0     # dB/s once the hold expires
+REGION_FALL = 10.0   # dB/s, slow so the numbers are readable
+
+
+def set_pdeathsig(sig):
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0)
+    except OSError:
+        pass
+
+
+class Analyzer:
+    """Hann-windowed FFT band levels. The window is applied in the frequency
+    domain (periodic Hann = the 3-tap kernel -1/4, 1/2, -1/4 over adjacent
+    bins), so the per-frame Python work is one pass over the bins."""
+
+    def __init__(self, mode):
+        self.set_mode(mode)
+
+    def set_mode(self, mode):
+        cfg = MODES.get(mode, MODES["bar"])
+        self.mode = mode if mode in MODES else "bar"
+        self.n = n = cfg["n"]
+        self.fps = cfg["fps"]
+        self.fall = cfg["fall"]
+        self.nbins = n // 2 + 1
+        # periodic Hann: sum w = n/2, sum w^2 = 3n/8, so ENBW = 1.5 bins.
+        # |X|^2 * scale == band power where a full-scale sine sums to 1.0
+        self.scale = 4.0 / (n * n / 4.0) / 1.5
+        self.df = RATE / n
+        self.ring = (ctypes.c_float * n)()
+        self.fin = (ctypes.c_float * n)()
+        self.fout = (ctypes.c_float * (2 * self.nbins))()
+        self.plan = FFTW.fftwf_plan_dft_r2c_1d(n, self.fin, self.fout, FFTW_ESTIMATE)
+        self.bar = [FLOOR] * len(OCT_CENTRES)
+        self.pop = [FLOOR] * (len(POP_EDGES) - 1)
+        self.peak = [FLOOR] * (len(POP_EDGES) - 1)
+        self.peak_t = [0.0] * (len(POP_EDGES) - 1)
+        self.region = [FLOOR] * 3
+
+    def samples(self):
+        return array.array("f", bytes(self.ring))
+
+    def push(self, mono):
+        """Append an array('f') of mono samples to the ring."""
+        n, m = self.n, len(mono)
+        base = ctypes.addressof(self.ring)
+        if m >= n:
+            ctypes.memmove(base, mono.buffer_info()[0] + (m - n) * 4, n * 4)
+        else:
+            ctypes.memmove(base, base + m * 4, (n - m) * 4)
+            ctypes.memmove(base + (n - m) * 4, mono.buffer_info()[0], m * 4)
+
+    def _cumulative(self):
+        ctypes.memmove(self.fin, self.ring, self.n * 4)
+        FFTW.fftwf_execute(self.plan)
+        out = self.fout[:]
+        re, im = out[0::2], out[1::2]
+        last = self.nbins - 1
+        # neighbours past either end mirror (real input: X[-k] = conj X[k])
+        re_l = [re[1]] + re[:-1]
+        im_l = [-im[1]] + im[:-1]
+        re_r = re[1:] + [re[last - 1]]
+        im_r = im[1:] + [-im[last - 1]]
+        sc = self.scale
+        power = [((0.5 * a - 0.25 * (b + c)) ** 2 + (0.5 * d - 0.25 * (e + f)) ** 2) * sc
+                 for a, b, c, d, e, f in zip(re, re_l, re_r, im, im_l, im_r)]
+        cum = [0.0]
+        total = 0.0
+        for v in power:
+            total += v
+            cum.append(total)
+        return cum
+
+    def _bands(self, cum, edges):
+        # bin k spans [(k-.5)df, (k+.5)df]; cum[j] is the power below edge j
+        top = len(cum) - 1
+        vals = []
+        for e in edges:
+            x = e / self.df + 0.5
+            if x <= 0:
+                vals.append(0.0)
+            elif x >= top:
+                vals.append(cum[top])
+            else:
+                i = int(x)
+                vals.append(cum[i] + (cum[i + 1] - cum[i]) * (x - i))
+        return [max(10.0 * math.log10(max(b - a, 1e-12)), FLOOR) for a, b in zip(vals, vals[1:])]
+
+    @staticmethod
+    def _release(disp, new, fall_step):
+        out = []
+        for d, v in zip(disp, new):
+            # light attack smoothing so bars don't flicker on every hop
+            o = d + (v - d) * 0.7 if v > d else max(d - fall_step, v)
+            out.append(max(o, FLOOR))
+        return out
+
+    def frame(self, fresh, now, dt):
+        cum = self._cumulative() if fresh else None
+        new_bar = self._bands(cum, OCT_EDGES) if cum else [FLOOR] * len(self.bar)
+        self.bar = self._release(self.bar, new_bar, self.fall * dt)
+        if self.mode != "popup":
+            return
+        if cum:
+            new_pop = self._bands(cum, POP_EDGES)
+            new_reg = self._bands(cum, REGION_EDGES)
+        else:
+            new_pop = [FLOOR] * len(self.pop)
+            new_reg = [FLOOR] * 3
+        self.pop = self._release(self.pop, new_pop, self.fall * dt)
+        for i, v in enumerate(self.pop):
+            if v >= self.peak[i]:
+                self.peak[i] = v
+                self.peak_t[i] = now
+            elif now - self.peak_t[i] > PEAK_HOLD:
+                self.peak[i] = max(self.peak[i] - PEAK_FALL * dt, v)
+        self.region = [max(r - REGION_FALL * dt, v) for r, v in zip(self.region, new_reg)]
+
+    def silent(self):
+        if self.mode == "popup":
+            return all(v <= FLOOR for v in self.pop) and all(v <= FLOOR for v in self.peak)
+        return all(v <= FLOOR for v in self.bar)
+
+    def line(self):
+        fmt = lambda a: " ".join("%.1f" % v for v in a)
+        if self.mode != "popup":
+            # the mini view is ~15 px tall: whole dB is plenty, and lets
+            # unchanged frames be skipped
+            return "F " + " ".join("%.0f" % v for v in self.bar)
+        return "F %s | %s | %s | %s" % (fmt(self.bar), fmt(self.pop), fmt(self.peak), fmt(self.region))
+
+
+class Capture:
+    """Supervised pw-record reading a sink monitor, passive and read-only."""
+
+    def __init__(self):
+        self.proc = None
+        self.target = ""
+        self.pending = b""
+        self.retry_at = 0.0
+        self.failures = 0
+
+    def start(self, target):
+        self.stop()
+        self.target = target
+        props = "{ stream.capture.sink = true node.passive = true node.name = omarchy-spectrum-remix " \
+                "media.name = \"Spectrum analyzer\" node.dont-reconnect = true"
+        if target:
+            props += " node.dont-fallback = true"
+        props += " }"
+        cmd = ["pw-record"]
+        if target:
+            cmd += ["--target", target]
+        cmd += ["-P", props, "--rate", str(RATE), "--channels", "2", "--format", "f32", "-"]
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                preexec_fn=lambda: set_pdeathsig(signal.SIGKILL))
+            os.set_blocking(self.proc.stdout.fileno(), False)
+            try:  # room for ~1 s of audio so frame-paced draining never stalls pw-record
+                fcntl.fcntl(self.proc.stdout.fileno(), F_SETPIPE_SZ, 1 << 19)
+            except OSError:
+                pass
+            say("S capturing %s" % (target or "@default"))
+        except OSError as exc:
+            self.proc = None
+            self._fail("spawn %s" % exc)
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        self.pending = b""
+
+    def _fail(self, why):
+        self.stop()
+        self.failures += 1
+        delay = min(10.0, 1.0 * self.failures)
+        self.retry_at = time.monotonic() + delay
+        say("S restart %.0fs %s" % (delay, why))
+
+    def fd(self):
+        return self.proc.stdout.fileno() if self.proc is not None else None
+
+    def read(self):
+        """Drain everything queued in the pipe and return it as one mono
+        float32 block (possibly empty); handles pw-record exit."""
+        chunks = []
+        while True:
+            try:
+                data = os.read(self.fd(), 1 << 19)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                self._fail("read %s" % exc)
+                return array.array("f")
+            if not data:
+                self._fail("pw-record exited")
+                return array.array("f")
+            chunks.append(data)
+        if not chunks:
+            return array.array("f")
+        self.failures = 0
+        buf = self.pending + b"".join(chunks)
+        usable = len(buf) - (len(buf) % 8)
+        self.pending = buf[usable:]
+        if usable == 0:
+            return array.array("f")
+        st = array.array("f", buf[:usable])
+        # NaN and inf fail the range test and become silence
+        return array.array("f", [(a + b) * 0.5 if -64.0 < a + b < 64.0 else 0.0
+                                 for a, b in zip(st[0::2], st[1::2])])
+
+
+def open_ctl():
+    """Open (creating if needed) the control FIFO. Never clobbers a path that
+    exists but is not a FIFO. O_RDWR keeps it from reporting EOF between
+    writers."""
+    if not CTL_PATH:
+        return None
+    try:
+        if not stat.S_ISFIFO(os.lstat(CTL_PATH).st_mode):
+            return None
+    except FileNotFoundError:
+        try:
+            os.mkfifo(CTL_PATH, 0o600)
+        except OSError:
+            return None
+    except OSError:
+        return None
+    try:
+        return os.open(CTL_PATH, os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return None
+
+
+def say(text):
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        raise SystemExit(0)
+
+
+def main():
+    set_pdeathsig(signal.SIGTERM)
+    mode, target = "bar", ""
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--mode" and i + 1 < len(args):
+            mode = args[i + 1]
+        elif a == "--target" and i + 1 < len(args):
+            target = args[i + 1]
+
+    an = Analyzer(mode)
+    cap = Capture()
+
+    def shutdown(*_):
+        cap.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    cap.start(target)
+    ctl_fd = open_ctl()
+    ctl_buf = b""
+    stdin_fd = sys.stdin.fileno()
+    stdin_buf = b""
+    last = time.monotonic()
+    next_frame = last
+    fresh = False
+    quiet_printed = False
+    last_line = ""
+
+    try:
+        while True:
+            now = time.monotonic()
+            if cap.proc is None and now >= cap.retry_at:
+                cap.start(cap.target)
+            # Active: wake once per frame and drain the pipe then. Idle (floor
+            # already printed): sleep until audio shows up on the pipe.
+            idle = quiet_printed and not fresh
+            fds = [stdin_fd]
+            if ctl_fd is not None:
+                fds.append(ctl_fd)
+            if idle and cap.fd() is not None:
+                fds.append(cap.fd())
+            wait = 0.5 if idle else max(0.0, next_frame - now)
+            ready, _, _ = select.select(fds, [], [], wait)
+            if not idle and cap.fd() is not None and time.monotonic() >= next_frame:
+                ready.append(cap.fd())
+
+            if stdin_fd in ready:
+                chunk = os.read(stdin_fd, 4096)
+                if not chunk:
+                    break
+                stdin_buf += chunk
+                while b"\n" in stdin_buf:
+                    raw, stdin_buf = stdin_buf.split(b"\n", 1)
+                    cmd, _, arg = raw.decode("utf-8", "replace").strip().partition(" ")
+                    if cmd == "mode" and arg in MODES and arg != an.mode:
+                        ring = an.samples()
+                        an.set_mode(arg)
+                        an.push(ring)
+                        quiet_printed = False
+                    elif cmd == "target" and arg.strip() != cap.target:
+                        cap.failures = 0
+                        cap.start(arg.strip())
+                        quiet_printed = False
+
+            if ctl_fd is not None and ctl_fd in ready:
+                try:
+                    ctl_buf += os.read(ctl_fd, 4096)
+                except BlockingIOError:
+                    pass
+                while b"\n" in ctl_buf:
+                    raw, ctl_buf = ctl_buf.split(b"\n", 1)
+                    word = raw.decode("utf-8", "replace").strip()
+                    if word in CTL_CMDS:
+                        say("C " + word)
+                ctl_buf = ctl_buf[-256:]
+
+            if cap.fd() is not None and cap.fd() in ready:
+                mono = cap.read()
+                if len(mono):
+                    an.push(mono)
+                    fresh = True
+
+            now = time.monotonic()
+            if now >= next_frame or (idle and fresh):
+                dt = min(0.25, now - last)
+                last = now
+                an.frame(fresh, now, dt)
+                fresh = False
+                text = an.line()
+                if an.silent():
+                    if not quiet_printed:
+                        say(text)
+                        quiet_printed = True
+                else:
+                    quiet_printed = False
+                    if text != last_line:
+                        say(text)
+                last_line = text
+                next_frame = now + 1.0 / an.fps
+    finally:
+        cap.stop()
+
+
+if __name__ == "__main__":
+    main()
